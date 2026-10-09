@@ -1,177 +1,239 @@
-# Isaac ROS 3.2 แบบ Native (ไม่ใช้ Docker) บน x86 Ubuntu 22.04
+set -e
 
-ชุด script สำหรับ build Isaac ROS (`release-3.2`) จาก source โดยตรงบนเครื่อง x86 + NVIDIA GPU
-เพื่อจำลอง environment ให้ใกล้เคียง Jetson Orin (JetPack 6.x) สำหรับ debug/test ก่อนขึ้นเครื่องจริง
-ใช้งานกับกล้อง Intel RealSense D435 + AprilTag detection (family `tag36h11`)
+WS=$HOME/workspaces/isaac_ros-dev
+BRANCH=release-3.2
+STEP=0
+step() { STEP=$((STEP+1)); echo; echo "===== [$STEP] $1 ====="; }
 
-> **สถานะ:** pipeline `RealSense -> Rectify -> AprilTag` ทำงานได้จริงบน release-3.2
-> (เห็น detection ใน `/tag_detections`) ดูหัวข้อ [สิ่งที่ยังไม่ได้ทดสอบ](#8-สิ่งที่ยังไม่ได้ทดสอบ) ก่อนนำไปใช้
+# ===== 0. Preflight =====
+step "Preflight check"
+[ -f /opt/ros/humble/setup.bash ] || { echo "ไม่พบ ROS 2 Humble (/opt/ros/humble)"; exit 1; }
+command -v nvidia-smi >/dev/null || { echo "ไม่พบ nvidia-smi (ยังไม่ได้ลง NVIDIA driver)"; exit 1; }
 
----
+# ถ้าไม่มี CUDA toolkit (ไม่มี nvcc) -> ติดตั้ง CUDA 12.6 toolkit ให้ (ตรงกับ JetPack 6.x)
+if [ ! -x /usr/local/cuda/bin/nvcc ]; then
+  echo "ไม่พบ CUDA toolkit -> จะติดตั้ง cuda-toolkit-12-6"
 
-## 1. เครื่องที่ทดสอบ
+  # เช็คว่า driver รองรับ CUDA >= 12.6
+  DRV_CUDA=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+\.[0-9]+' | head -1)
+  echo "Driver รองรับ CUDA สูงสุด: ${DRV_CUDA:-unknown}"
+  if [ -n "$DRV_CUDA" ] && [ "$(printf '%s\n' 12.6 "$DRV_CUDA" | sort -V | head -1)" != "12.6" ]; then
+    echo "Driver เก่าเกินไป (ต้องรองรับ CUDA >= 12.6) กรุณาอัปเดต NVIDIA driver ก่อน"
+    exit 1
+  fi
 
-| รายการ | ค่า |
-|---|---|
-| OS | Ubuntu 22.04 |
-| ROS | ROS 2 Humble |
-| GPU | NVIDIA RTX 3050 6GB Laptop (Ampere, sm_86) |
-| CUDA | 13.0 (ตอน debug) / script เวอร์ชันใหม่ตั้งใจใช้ 12.6 |
-| RAM | 15 GB |
-| กล้อง | Intel RealSense D435 (ต่อ USB 2.1 มี warning เรื่อง performance) |
+  # เช็คพื้นที่ดิสก์ (toolkit ใช้ราว 5-8GB)
+  FREE_GB=$(df -BG --output=avail /usr/local | tail -1 | tr -dc '0-9')
+  [ "${FREE_GB:-0}" -ge 10 ] || { echo "พื้นที่ว่างไม่พอ (เหลือ ${FREE_GB}GB, ต้องการ >= 10GB)"; exit 1; }
 
-## 2. สิ่งที่ต้องมีก่อนรัน
+  if ! dpkg -s cuda-keyring >/dev/null 2>&1; then
+    wget -q -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+    sudo dpkg -i /tmp/cuda-keyring.deb
+    rm -f /tmp/cuda-keyring.deb
+  fi
+  sudo apt update
+  # ลงเฉพาะ toolkit ไม่ใช่ metapackage "cuda" (กันไปแตะ driver)
+  sudo apt install -y cuda-toolkit-12-6
 
-- Ubuntu 22.04 + ROS 2 Humble (`/opt/ros/humble`)
-- NVIDIA GPU + driver ที่รองรับ CUDA >= 12.6 (ดูจาก `nvidia-smi`)
-- ดิสก์ว่างอย่างน้อย 10 GB สำหรับ CUDA (ยังไม่รวมพื้นที่ build workspace)
-- RAM 15 GB ขึ้นไป (หรือเพิ่ม swap) build ใช้ `--parallel-workers 1` เพราะเคย OOM
-- อินเทอร์เน็ต (ดาวน์โหลด apt, git clone, CV-CUDA .deb)
-- แนะนำ: กล้อง D435 ต่อผ่าน USB 3
+  # ชี้ /usr/local/cuda ไปที่ 12.6 (ถ้ายังไม่มี หรือเป็น symlink เสีย)
+  if [ ! -e /usr/local/cuda ]; then
+    sudo ln -sfn /usr/local/cuda-12.6 /usr/local/cuda
+  fi
+fi
+/usr/local/cuda/bin/nvcc --version | tail -1
 
-เช็คก่อนรัน:
-```bash
-nvidia-smi | head -4                       # driver + CUDA Version >= 12.6
-ls /etc/apt/sources.list.d/ | grep -i ros  # ต้องไม่มี ros2.list ซ้ำกับ ros2.sources
-df -h / | tail -1
-free -h | head -2
-```
+CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+echo "GPU arch: sm_${CUDA_ARCH} | CUDA: $(readlink -f /usr/local/cuda)"
 
-## 3. วิธีใช้
+# ===== Locale =====
+step "Locale"
+sudo apt update && sudo apt install -y locales
+sudo locale-gen en_US en_US.UTF-8
+sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LANG=en_US.UTF-8
 
-> **ไฟล์ที่ดาวน์โหลดมาจะอยู่ใน `~/Downloads` ไม่ใช่ Home** ต้องย้ายมาที่ Home (`~`) ก่อนรัน
-> (ไม่งั้นสั่ง `~/setup_isaac_ros3.2.sh` จะหาไฟล์ไม่เจอ)
-> ```bash
-> mv ~/Downloads/setup_isaac_ros3.2.sh ~/
-> cd ~
-> ```
-> ถ้าโหลดซ้ำแล้วชื่อไฟล์เป็น `setup_isaac_ros3.2 (1).sh` ให้เปลี่ยนชื่อตอนย้าย:
-> `mv ~/Downloads/"setup_isaac_ros3.2 (1).sh" ~/setup_isaac_ros3.2.sh`
+# ===== Base deps =====
+step "Base dependencies"
+sudo apt update && sudo apt install -y gnupg wget curl software-properties-common git
+sudo add-apt-repository -y universe
 
-```bash
-chmod +x setup_isaac_ros3.2.sh
-./setup_isaac_ros3.2.sh
-```
+# ===== Isaac ROS apt repo (release-3.2) =====
+step "Isaac ROS apt repository (3.2)"
+wget -qO - https://isaac.download.nvidia.com/isaac-ros/repos.key | sudo apt-key add -
+ISAAC_LINE="deb https://isaac.download.nvidia.com/isaac-ros/release-3 $(lsb_release -cs) release-3.2"
+grep -qxF "$ISAAC_LINE" /etc/apt/sources.list || echo "$ISAAC_LINE" | sudo tee -a /etc/apt/sources.list
+sudo apt-get update
 
-Script เป็น **idempotent** (รันซ้ำได้ ข้ามของที่มีอยู่แล้ว) ถ้าล้มกลางทาง แก้แล้วรันซ้ำได้เลย
-แต่ละขั้นพิมพ์หมายเลข `[N]` ไว้ ใช้ระบุจุดที่ล้มได้
+# ===== ros-dev-tools =====
+step "ros-dev-tools"
+sudo apt install -y ros-dev-tools
 
-### ⚠️ ขั้นตอนบังคับหลัง script รันจบ — ต้องพิมพ์คำสั่งนี้เองใน terminal
+# ===== VPI =====
+step "VPI (key ตรงจาก NVIDIA กัน keyserver timeout)"
+wget -qO - https://repo.download.nvidia.com/jetson/jetson-ota-public.asc | sudo apt-key add -
+VPI_LINE="deb https://repo.download.nvidia.com/jetson/x86_64/jammy r36.4 main"
+grep -rqF "jetson/x86_64/jammy r36.4" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || \
+  sudo add-apt-repository -y "$VPI_LINE"
+sudo apt update
+sudo apt install -y libnvvpi3 vpi3-dev
 
-**"source" ในที่นี้ไม่ใช่ลิงก์หรือไฟล์ที่ต้องไปหา — มันคือชื่อคำสั่ง** พิมพ์ตรงๆ ใน terminal:
+# ===== CUDA 12.6 runtime only =====
+step "CUDA 12.6 runtime (cudart เท่านั้น)"
+sudo apt install -y cuda-cudart-12-6
 
-```bash
+# ===== nvToolsExt (linking) =====
+step "libnvToolsExt"
+sudo apt install -y libnvtoolsext1
+sudo ln -sf /usr/lib/x86_64-linux-gnu/libnvToolsExt.so.1 /usr/lib/x86_64-linux-gnu/libnvToolsExt.so
+sudo ldconfig
+
+# ===== CV-CUDA =====
+step "CV-CUDA (cuda12)"
+if ! dpkg -s cvcuda-dev >/dev/null 2>&1 && ! dpkg -l | grep -q cvcuda; then
+  mkdir -p ~/Downloads && cd ~/Downloads
+  wget -nc https://github.com/CVCUDA/CV-CUDA/releases/download/v0.16.0/cvcuda-lib-0.16.0-cuda12-x86_64-linux.deb
+  wget -nc https://github.com/CVCUDA/CV-CUDA/releases/download/v0.16.0/cvcuda-dev-0.16.0-cuda12-x86_64-linux.deb
+  sudo dpkg -i cvcuda-lib-0.16.0-cuda12-x86_64-linux.deb cvcuda-dev-0.16.0-cuda12-x86_64-linux.deb
+  sudo apt --fix-broken install -y
+  rm -f ~/Downloads/cvcuda-*.deb
+else
+  echo "CV-CUDA ติดตั้งแล้ว ข้าม"
+fi
+
+# ===== Environment variables =====
+# สำคัญ: ต้อง export ใน script นี้โดยตรง เพราะ 'source ~/.bashrc' ใช้ไม่ได้ใน non-interactive shell
+step "Environment variables"
+CUDA12_LIB=/usr/local/cuda-12.6/targets/x86_64-linux/lib
+CCCL_INC=/usr/local/cuda/targets/x86_64-linux/include/cccl
+
+export ISAAC_ROS_WS=$WS/
+export CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda
+export PATH=/usr/local/cuda/bin${PATH:+:${PATH}}
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${CUDA12_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+export CPLUS_INCLUDE_PATH=${CCCL_INC}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
+export C_INCLUDE_PATH=${CCCL_INC}${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
+export CMAKE_PREFIX_PATH=/opt/nvidia/vpi3${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}
+
+if ! grep -q "# --- isaac_ros env ---" ~/.bashrc; then
+cat >> ~/.bashrc << 'ENV_END'
+# --- isaac_ros env ---
+export ISAAC_ROS_WS=${HOME}/workspaces/isaac_ros-dev/
+export CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda
+export PATH=/usr/local/cuda/bin${PATH:+:${PATH}}
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda-12.6/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+export CPLUS_INCLUDE_PATH=/usr/local/cuda/targets/x86_64-linux/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
+export C_INCLUDE_PATH=/usr/local/cuda/targets/x86_64-linux/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
+export CMAKE_PREFIX_PATH=/opt/nvidia/vpi3${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}
+# --- end isaac_ros env ---
+ENV_END
+fi
+
+# ===== Workspace + clone =====
+step "Workspace + clone ($BRANCH)"
+mkdir -p $WS/src
+cd $WS/src
+[ -d isaac_ros_common ]         || git clone -b $BRANCH https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_common.git
+[ -d isaac_ros_nitros ]         || git clone -b $BRANCH https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nitros.git
+[ -d isaac_ros_image_pipeline ] || git clone -b $BRANCH https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_image_pipeline.git
+[ -d isaac_ros_apriltag ]       || git clone -b $BRANCH https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_apriltag.git
+[ -d realsense-ros ]            || git clone -b ros2-master https://github.com/IntelRealSense/realsense-ros.git
+[ -d negotiated ]               || git clone https://github.com/osrf/negotiated.git
+
+# ===== Launch file =====
+step "Launch file (full_camera_pipeline)"
+LAUNCH_DIR=$WS/src/isaac_ros_apriltag/isaac_ros_apriltag/launch
+mkdir -p $LAUNCH_DIR
+cat > $LAUNCH_DIR/full_camera_pipeline.launch.py << 'LAUNCH_END'
+import launch
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
+
+
+def generate_launch_description():
+
+    apriltag_backend_arg = DeclareLaunchArgument('apriltag_backend', default_value='CUDA')
+
+    realsense_camera_node = ComposableNode(
+        package='realsense2_camera',
+        plugin='realsense2_camera::RealSenseNodeFactory',
+        name='realsense2_camera',
+        namespace='',
+        parameters=[{
+            'color_width': 1920,
+            'color_height': 1080,
+        }],
+        remappings=[('/realsense2_camera/color/image_raw', '/image'),
+                    ('/realsense2_camera/color/camera_info', '/camera_info')]
+    )
+
+    rectify_node = ComposableNode(
+        package='isaac_ros_image_proc',
+        plugin='nvidia::isaac_ros::image_proc::RectifyNode',
+        name='rectify',
+        namespace='',
+        parameters=[{
+            'output_width': 1920,
+            'output_height': 1080,
+        }]
+    )
+
+    apriltag_node = ComposableNode(
+        package='isaac_ros_apriltag',
+        plugin='nvidia::isaac_ros::apriltag::AprilTagNode',
+        name='apriltag',
+        namespace='',
+        parameters=[{
+            'backend': LaunchConfiguration('apriltag_backend'),
+        }]
+    )
+
+    full_pipeline_container = ComposableNodeContainer(
+        package='rclcpp_components',
+        name='full_camera_pipeline_container',
+        namespace='',
+        executable='component_container_mt',
+        composable_node_descriptions=[
+            realsense_camera_node,
+            rectify_node,
+            apriltag_node,
+        ],
+        output='screen'
+    )
+
+    return launch.LaunchDescription([
+        apriltag_backend_arg,
+        full_pipeline_container,
+    ])
+LAUNCH_END
+
+# ===== rosdep =====
+step "rosdep"
+source /opt/ros/humble/setup.bash
+pip3 install posix_ipc
+sudo rosdep init 2>/dev/null || true
+rosdep update
+cd $WS
+# rosdep จะ error ค้างเรื่อง negotiated/posix_ipc (ปกติ ไม่กระทบ) จึงต้อง || true ไม่ให้ set -e ตัดจบ
+rosdep install --from-paths src --ignore-src -r -y || echo "[warn] rosdep มี error บางตัว (คาดไว้แล้ว: negotiated/posix_ipc)"
+
+# ===== Build =====
+step "colcon build (sm_${CUDA_ARCH}, parallel-workers 1)"
+cd $WS
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install \
+  --cmake-args -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+  --parallel-workers 1
+
+# ===== Source overlay =====
+step "Source overlay"
+SRC_LINE="source $WS/install/setup.bash"
+grep -qxF "$SRC_LINE" ~/.bashrc || echo "$SRC_LINE" >> ~/.bashrc
+source $WS/install/setup.bash
+
+echo
+echo "===== เสร็จสิ้น ====="
+ros2 pkg list | grep apriltag
+echo "รันด้วย: ros2 launch isaac_ros_apriltag full_camera_pipeline.launch.py"
 source ~/.bashrc
-```
-
-**ทำไมต้องพิมพ์เองอีกรอบ ทั้งที่ script ก็มีคำสั่งนี้อยู่ข้างในแล้ว:**
-เวลารัน `./setup_isaac_ros3.2.sh` ตัว script จะทำงานเป็น **"โปรเซสลูก"** แยกออกจาก terminal หลักของคุณ
-ตัวแปรต่างๆ ที่ script ตั้งค่าไว้ข้างใน (เช่น `CUDA_TOOLKIT_ROOT_DIR`, path ของ `isaac_ros_apriltag`)
-จะ**หายไปทันทีที่ script จบ** ไม่ส่งผลย้อนกลับมาที่ terminal ที่คุณพิมพ์คำสั่งเรียกมัน — เป็นพฤติกรรม
-ปกติของ Linux process ไม่ใช่บั๊ก ดังนั้นแม้ script จะรันผ่านครบ 100% **terminal ที่คุณใช้อยู่ก็ยังไม่รู้จัก
-ตัวแปรเหล่านั้น** ต้องสั่ง `source ~/.bashrc` ด้วยมือเองอีกครั้งหนึ่ง (หรือปิดแล้วเปิด terminal ใหม่แทนก็ได้
-ผลเหมือนกัน) ทุกครั้งหลัง script จบ
-
-```bash
-source ~/.bashrc          # บังคับให้ terminal ปัจจุบันอ่านค่าตัวแปรใหม่จาก .bashrc
-
-# เช็คว่าสำเร็จ — ควรเห็น path ของ package ขึ้นมา ไม่ error
-ros2 pkg prefix isaac_ros_apriltag
-
-# รัน pipeline
-ros2 launch isaac_ros_apriltag full_camera_pipeline.launch.py
-```
-
-ตรวจผล:
-```bash
-ros2 topic echo /tag_detections --once
-```
-
-## 4. Script ทำอะไรบ้าง
-
-| ขั้น | งาน |
-|---|---|
-| Preflight | เช็ค ROS, nvidia-smi, CUDA toolkit (ถ้าไม่มี `nvcc` จะเช็ค driver/ดิสก์แล้วลง `cuda-toolkit-12-6`), หา CUDA arch จาก `nvidia-smi` อัตโนมัติ |
-| Locale / base deps | `locales`, `gnupg`, `curl`, `git`, universe repo |
-| Isaac ROS apt repo | เพิ่ม `release-3.2` |
-| ros-dev-tools | `sudo apt install ros-dev-tools` |
-| VPI | เพิ่ม repo `jetson/x86_64/jammy r36.4` (ใช้ key ตรงจาก NVIDIA กัน keyserver timeout) ลง `libnvvpi3 vpi3-dev` |
-| CUDA 12 runtime | `cuda-cudart-12-6` (binary ของ Isaac ROS บางตัวผูกกับ `libcudart.so.12`) |
-| nvToolsExt | `libnvtoolsext1` + symlink `libnvToolsExt.so` |
-| CV-CUDA | ดาวน์โหลด `.deb` v0.16.0 (cuda12) จาก GitHub releases |
-| Env vars | export ใน script และเขียนลง `~/.bashrc` (มี marker `# --- isaac_ros env ---`) |
-| Clone | `isaac_ros_common`, `isaac_ros_nitros`, `isaac_ros_image_pipeline`, `isaac_ros_apriltag` (branch `release-3.2`), `realsense-ros` (`ros2-master`), `negotiated` |
-| Launch file | สร้าง `full_camera_pipeline.launch.py` ไว้ใน `isaac_ros_apriltag/launch/` |
-| rosdep | `rosdep install` (error เรื่อง `negotiated`/`posix_ipc` เป็นเรื่องปกติ ไม่กระทบ) |
-| Build | `colcon build --symlink-install --cmake-args -DCMAKE_CUDA_ARCHITECTURES=<arch> --parallel-workers 1` |
-| Source overlay | เขียน `source .../install/setup.bash` ลง `~/.bashrc` |
-
-โครงสร้าง workspace: `~/workspaces/isaac_ros-dev/src` (clone ทุก package ต้องอยู่ใน `src/` รวมถึง `negotiated`)
-build ต้องรันที่ root ของ workspace ไม่ใช่ใน `src/`
-
-## 5. Pipeline ที่ใช้งานได้
-
-`RealSense D435 (color 1920x1080) -> /image, /camera_info -> Rectify -> AprilTag (backend CUDA)`
-
-จุดที่ต้องระวัง (เคยเป็นสาเหตุที่ไม่ทำงาน):
-- `color_width` / `color_height` ต้องเป็น **1920 x 1080** (ไม่ใช่ 1080 x 1920)
-- Remapping ของ RealSense ต้องมี prefix `/realsense2_camera/` เช่น `/realsense2_camera/color/image_raw`
-  (realsense-ros เวอร์ชันล่าสุด publish ชื่อ topic ต่างจากที่เอกสาร NVIDIA เขียนไว้)
-
-## 6. บั๊กที่เจอและวิธีแก้ (ฝังอยู่ใน script แล้ว)
-
-| # | อาการ | วิธีแก้ |
-|---|---|---|
-| 1 | apt Signed-By conflict (ROS repo ซ้ำ) | ลบ `ros2.list` ที่ซ้ำกับ `ros2.sources` (**script ไม่ได้ทำให้** ต้องทำเองถ้าเจอ) |
-| 2 | rosdep หา `negotiated` / `posix_ipc` ไม่เจอ | clone source + `pip3 install posix_ipc` |
-| 3 | CMake: `Specify CUDA_TOOLKIT_ROOT_DIR` | `export CUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda` ให้มีผลตอน build (อย่าพึ่ง `source ~/.bashrc` ใน script เพราะ non-interactive shell จะ return ก่อน) |
-| 4 | หา `vpi` ไม่เจอ | เพิ่ม repo Jetson x86_64 + `CMAKE_PREFIX_PATH=/opt/nvidia/vpi3` |
-| 5 | `cuda/std/complex` ไม่เจอ | `CPLUS_INCLUDE_PATH` / `C_INCLUDE_PATH` ชี้ `.../include/cccl` (จำเป็นเมื่อใช้ CUDA 13) |
-| 6 | nvcc: unsupported `compute_70` | ใส่ `-DCMAKE_CUDA_ARCHITECTURES=<arch>` เสมอ |
-| 7 | `cannot find -lnvToolsExt` | `libnvtoolsext1` (จาก Ubuntu repo) + symlink `.so` |
-| 8 | OOM (`Killed signal cc1plus`) | `--parallel-workers 1` ตั้งแต่คำสั่ง build แรก (กัน race ระหว่าง `negotiated` กับ `isaac_ros_nitros` ด้วย) |
-| 9 | `undefined reference to cudaFree@libcudart.so.12` | ติดตั้ง `cuda-cudart-12-6` + เพิ่ม path ใน `LD_LIBRARY_PATH` |
-| 10 | `nvcv/Tensor.hpp` ไม่เจอ | ติดตั้ง CV-CUDA `.deb` แบบ `cuda12` |
-| 11 | `isaac_ros_nitros` หา `negotiated` header ไม่เจอ | `negotiated` ต้อง clone ใน `src/` |
-
-## 7. ปัญหาที่ยังไม่ได้แก้ / ข้อจำกัด
-
-- **Stereo disparity + point cloud ไม่ทำงาน** (`GXF_INVALID_DATA_FORMAT`) infra1/infra2 (mono) และ depth (Z16)
-  ต้องผ่าน node แปลง format ก่อน ซึ่งยังไม่มี จึงตัดออกจาก launch file เหลือแค่ RealSense -> Rectify -> AprilTag
-- **release-3.1 ยังไม่จบ** (script นี้ทำเฉพาะ 3.2) ปัญหาที่ค้าง:
-  - `nvToolsExt.h` หาไม่เจอตอน compile (ทางแก้ที่ลอง: `cuda-nvtx-13-0` + symlink `nvtx3/nvToolsExt.h` + include path ยังไม่ยืนยันว่าผ่าน)
-  - `gxf_isaac_fiducials` ติดตั้งผ่าน apt ตรงๆ ไม่ได้ (ต้อง `apt-get download` แล้ว `dpkg -i --ignore-depends=ros-humble-isaac-ros-nitros`)
-  - สาเหตุที่ 3.2 ไม่เจอ `nvToolsExt.h` ยังเป็นแค่ข้อสันนิษฐาน ยืนยันได้ด้วย
-    `grep -rn "nvToolsExt.h" src/ --include=*.cpp --include=*.hpp --include=*.h --include=*.cu --include=CMakeLists.txt`
-- ตัว AprilTag ใช้ backend `CUDA` ผ่าน launch argument `apriltag_backend`
-
-## 8. สิ่งที่ยังไม่ได้ทดสอบ
-
-อย่าเชื่อว่าผ่านจนกว่าจะรันเอง:
-
-- **เครื่องสะอาดจริง** (มีแค่ ROS ไม่เคยลง Isaac ROS) รอบที่ผ่านคือรันต่อบนเครื่องที่มีของติดตั้งค้างอยู่
-- **CUDA 12.6 เป็นตัวหลัก** ส่วนการติดตั้ง `cuda-toolkit-12-6` อัตโนมัติเพิ่งเขียนเสร็จ ยังไม่เคยรันจริง
-  (บั๊กส่วนใหญ่เจอตอนใช้ CUDA 13.0 เป็นหลัก เลยคาดว่าจะลดลง แต่ยังไม่ยืนยัน)
-- **`cleanup_isaac_ros.sh`** ยังไม่เคยรัน และต้องอัปเดตให้ตรงกับ setup 3.2 (repo `release-3.2`, marker ใน `.bashrc`, CUDA 12.6)
-  แนะนำให้ไม่ลบ CUDA toolkit เป็นค่าเริ่มต้น (ทำเป็น flag `--with-cuda`) และลบ package แบบระบุชื่อ ไม่ใช้ wildcard
-- **`realsense2_camera` บนเครื่องสะอาด** rosdep อาจลง `librealsense2` ไม่ครบ ถ้า build ล้มที่ package นี้ ให้ลง librealsense จาก Intel apt repo
-- ลิงก์ CV-CUDA v0.16.0 อาจหมดอายุ
-
-## 9. Troubleshooting
-
-| อาการ | สาเหตุที่น่าจะเป็น / ทางแก้ |
-|---|---|
-| `Package 'isaac_ros_apriltag' not found` | ยังไม่ได้พิมพ์ `source ~/.bashrc` เอง หลัง script รันจบ (ดูกรอบเตือนในหัวข้อ 3) หรือ workspace ยังไม่ได้ `source ~/workspaces/isaac_ros-dev/install/setup.bash` |
-| `Specify CUDA_TOOLKIT_ROOT_DIR` | ไม่มี `/usr/local/cuda` หรือตัวแปรไม่ได้ export ในเทอร์มินัลที่กำลัง build อยู่ — เช็คด้วย `echo $CUDA_TOOLKIT_ROOT_DIR` ถ้าว่างเปล่าให้ `source ~/.bashrc` ก่อน |
-| Script หยุดที่ preflight | ไม่มี ROS Humble / nvidia-smi / driver เก่าเกินไป / ดิสก์ไม่พอ |
-| Build ค้างหรือ `Killed` | RAM ไม่พอ เพิ่ม swap |
-| ภาพไม่ขึ้น / node ค้าง | ต่อ USB 3, ลด `color_width` / `color_height` ใน launch file |
-| ไม่มี `/tag_detections` | ตรวจ tag family (`tag36h11`), ขนาด tag, และว่า topic `/image` มีข้อมูลไหม (`ros2 topic hz /image`) |
-
-## 10. ไอเดียทำต่อ
-
-1. รัน setup บนเครื่องสะอาดจริงและบันทึกผล
-2. อัปเดต `cleanup_isaac_ros.sh` ให้ตรงกับ setup 3.2 แล้วทดสอบวงจร cleanup -> setup
-3. ทำให้ stereo disparity + point cloud ทำงาน (เพิ่ม node แปลง format ของ infra/depth)
-4. สร้าง 3.1 ให้จบ (แก้ `nvToolsExt.h` + `gxf_isaac_fiducials`) แล้วเทียบกับ 3.2
-5. ทดสอบกับ tag family / ขนาด tag จริงของงาน แล้ว port ขึ้น Jetson Orin
